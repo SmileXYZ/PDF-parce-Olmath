@@ -4,12 +4,33 @@ services:
     image: olymp-parser:1.0
     container_name: olymp-parser
     restart: unless-stopped
-    ports:
-      - "8080:8080"          # за Coolify/Traefik можно убрать и повесить домен
+
+    # ВАЖНО для Coolify: порт на хост НЕ публикуем — маршрутит Traefik.
+    # expose открывает 8080 только внутри docker-сети (для Traefik и n8n),
+    # хостовый 0.0.0.0:8080 не занимается => конфликта "port already allocated" нет.
+    expose:
+      - "8080"
+
     environment:
       MAX_PDF_BYTES: "41943040"
+
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+# ------------------------------------------------------------------------
+# Coolify UI после этого:
+#   1) Приложение -> Settings -> "Ports Exposes" = 8080
+#   2) Domains: повесь домен, напр. https://parser.mkdgrupp.ru
+#      Coolify сам добавит Traefik-лейблы и TLS. Наружу пойдёт 443, не 8080.
+#   3) Если парсер НЕ надо светить в интернет — домен можно не вешать,
+#      а ходить в него из n8n по внутренней сети (см. ниже).
+#
+# --- ЕСЛИ ВСЁ-ТАКИ НУЖЕН ПРЯМОЙ ДОСТУП С ХОСТА ---
+# замени блок expose на ports с СВОБОДНЫМ хостовым портом:
+#     ports:
+#       - "8090:8080"     # 8090 на хосте свободен, внутри всё те же 8080
+# и тогда n8n ходит на http://<host-ip>:8090
+# ------------------------------------------------------------------------
