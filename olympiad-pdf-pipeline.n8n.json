@@ -1,0 +1,379 @@
+{
+  "name": "Olympiad PDF -> parser microservice -> Supabase",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "olympiad-pdf",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryPropertyName": "file",
+          "rawBody": true
+        }
+      },
+      "id": "wh",
+      "name": "Webhook (PDF in)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1120,
+        200
+      ],
+      "webhookId": "olympiad-pdf"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $binary && Object.keys($binary).length ? 'bin' : 'json' }}",
+                    "rightValue": "bin",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "route",
+      "name": "Binary or URL?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -920,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PARSER_URL }}/parse?images=base64",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/pdf"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "file",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "call-bin",
+      "name": "Parser: binary PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PARSER_URL }}/parse?images=base64",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.url, headers: $json.headers || { Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY } }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "call-url",
+      "name": "Parser: URL (Supabase)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Разворачиваем фигуры всех задач в отдельные items для заливки в Storage.\n// batch — папка в bucket (детерминированно из $execution.id, пересчитывается в Assemble).\nconst doc = $input.first().json;\nconst batch = ($execution.id + '_' + (doc.source || 'olymp')).replace(/[^\\w.-]/g, '_');\nconst items = [];\nfor (const t of doc.tasks || []) {\n  for (const f of t.figures || []) {\n    if (!f.b64) continue;\n    items.push({\n      json: { fig_id: f.id, batch, mime: f.mime || 'image/png' },\n      binary: {\n        data: { data: f.b64, mimeType: f.mime || 'image/png', fileName: f.id + '.png' }\n      }\n    });\n  }\n}\nif (!items.length) return [{ json: { _no_figs: true, batch } }];\nreturn items;"
+      },
+      "id": "flatten",
+      "name": "Flatten figures -> binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.fig_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "has-figs",
+      "name": "Has figures?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -260,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/storage/v1/object/olympiad-figures/{{ $json.batch }}/{{ $json.fig_id }}.png",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "image/png"
+            },
+            {
+              "name": "x-upsert",
+              "value": "true"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {}
+      },
+      "id": "upload",
+      "name": "Upload figure -> Storage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -40,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Финал: берём распарсенный документ ПРЯМО из ноды-парсера (какая ветка сработала),\n// строим публичные URL картинок (детерминированно), подставляем вместо {{FIG:id}}.\nlet doc;\ntry { doc = $('Parser: binary PDF').first().json; } catch (e) {}\nif (!doc || !doc.tasks) { try { doc = $('Parser: URL (Supabase)').first().json; } catch (e) {} }\nif (!doc || !doc.tasks) throw new Error('no parser output found');\n\nconst batch = ($execution.id + '_' + (doc.source || 'olymp')).replace(/[^\\w.-]/g, '_');\nconst base = $env.SUPABASE_URL + '/storage/v1/object/public/olympiad-figures/' + batch + '/';\n\nconst urlByFig = {};\nfor (const t of doc.tasks) for (const f of t.figures || []) urlByFig[f.id] = base + f.id + '.png';\n\nconst repl = (s) => s ? s.replace(/\\{\\{FIG:([\\w-]+)\\}\\}/g,\n  (m, id) => urlByFig[id] ? `![fig](${urlByFig[id]})` : m) : s;\n\nconst rows = [];\nfor (const t of doc.tasks) {\n  const figures = (t.figures || []).map(f => ({ id: f.id, page: f.page, bbox: f.bbox, url: urlByFig[f.id] }));\n  rows.push({\n    olympiad_title: doc.olympiad_title || doc.source || null,\n    task_number: t.number,\n    author: t.author,\n    statement_md: repl(t.statement_md),\n    answer_md: repl(t.answer_md),\n    solutions: (t.solutions || []).map(s => ({ title: s.title, body_md: repl(s.body_md) })),\n    comments: (t.comments || []).map(c => ({ title: c.title, body_md: repl(c.body_md) })),\n    figures,\n    meta: t.meta || {},\n    verified: false,\n    source_pdf: doc.source || null\n  });\n}\nreturn [{ json: { rows, count: rows.length } }];"
+      },
+      "id": "assemble",
+      "name": "Assemble rows + URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/olympiad_tasks",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.rows) }}",
+        "options": {}
+      },
+      "id": "insert",
+      "name": "Insert tasks (Supabase)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, inserted: Array.isArray($json) ? $json.length : 0, count: $('Assemble rows + URLs').first().json.count }) }}",
+        "options": {}
+      },
+      "id": "resp",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook (PDF in)": {
+      "main": [
+        [
+          {
+            "node": "Binary or URL?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Binary or URL?": {
+      "main": [
+        [
+          {
+            "node": "Parser: binary PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parser: URL (Supabase)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser: binary PDF": {
+      "main": [
+        [
+          {
+            "node": "Flatten figures -> binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser: URL (Supabase)": {
+      "main": [
+        [
+          {
+            "node": "Flatten figures -> binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten figures -> binary": {
+      "main": [
+        [
+          {
+            "node": "Has figures?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has figures?": {
+      "main": [
+        [
+          {
+            "node": "Upload figure -> Storage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble rows + URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload figure -> Storage": {
+      "main": [
+        [
+          {
+            "node": "Assemble rows + URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble rows + URLs": {
+      "main": [
+        [
+          {
+            "node": "Insert tasks (Supabase)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert tasks (Supabase)": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "olympiad-parser-pipeline"
+  }
+}
