@@ -819,6 +819,17 @@ def parse(pdf_path, outdir):
                         block.append(lines[j]); j += 1
                     x0 = min(bb['x0'] for bb in block) - 3; x1 = max(bb['x1'] for bb in block) + 3
                     y0 = min(bb['y0'] for bb in block) - 3; y1 = max(bb['y1'] for bb in block) + 3
+                    nz = [s for bb in block for s in bb['spans'] if s['text'].strip()]
+                    if len(nz) == 1 and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,2}'?",
+                                                     nz[0]['text'].strip()) \
+                            and not prof.is_math_font(nz[0]['font']) \
+                            and not any(0xE000 <= ord(c) <= 0xF8FF for c in nz[0]['text']):
+                        L2 = dict(L)
+                        L2['pre_md'] = '$%s$' % nz[0]['text'].strip()
+                        L2['figs'] = []
+                        stream.append((pno, L['y'], 'line', L2))
+                        i = j
+                        continue
                     mi += 1
                     fid = 'm%d_%d' % (pno + 1, mi)
                     rect = fitz.Rect(x0, y0, x1, y1) & page.rect
@@ -847,6 +858,15 @@ def parse(pdf_path, outdir):
                         nonlocal mi
                         if not run:
                             return
+                        nz = [s for s in run if s['text'].strip()]
+                        if len(nz) == 1:
+                            t1 = nz[0]['text'].strip()
+                            if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,2}'?", t1) \
+                                    and not prof.is_math_font(nz[0]['font']) \
+                                    and not any(0xE000 <= ord(c) <= 0xF8FF for c in t1):
+                                parts_md.append('$%s$' % t1)
+                                run.clear()
+                                return
                         rx0 = min(s['bbox'][0] for s in run) - 2
                         rx1 = max(s['bbox'][2] for s in run) + 2
                         ry0 = min(s['bbox'][1] for s in run) - 2
