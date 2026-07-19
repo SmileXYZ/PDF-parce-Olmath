@@ -595,6 +595,8 @@ def detect_graphics(page, curves, draw_rects, img_rects, prof=None):
 
 # ======================================================================= MATH 2D
 def units_to_tex(units, base_size, prof):
+    ssz = [u['span']['size'] for u in units if 'span' in u and u['span']['text'].strip()]
+    local = max(ssz) if ssz else base_size
     out, script, base_y = [], 0, None
     for u in units:
         if 'tex' in u:
@@ -606,8 +608,8 @@ def units_to_tex(units, base_size, prof):
         txt = prof.to_tex(s['text'])
         size = s['size']
         cy = (s['bbox'][1] + s['bbox'][3]) / 2
-        if size < base_size * 0.82 and base_y is not None:
-            want = 1 if cy < base_y - 0.4 else -1
+        if size < local * 0.82 and base_y is not None and abs(cy - base_y) > local * 0.22:
+            want = 1 if cy < base_y else -1
             if script != want:
                 if script:
                     out.append('}')
