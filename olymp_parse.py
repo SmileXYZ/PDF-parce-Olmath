@@ -128,6 +128,12 @@ class LatexQuartz(Profile):     # macOS Quartz LaTeX (Ломоносов testPDF
                '\u041e\u043b\u0438\u043c\u043f\u0438\u0430\u0434\u0430 \u0448\u043a\u043e\u043b',   # Олимпиада школ
                '\u0417\u0430\u043a\u043b\u044e\u0447\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u044d\u0442\u0430\u043f')  # Заключительный этап
 
+    def handle_stream(self, ctx, kind, payload, plain=None):
+        if kind == 'table' and ('\u041d\u043e\u043c\u0435\u0440 \u0437\u0430\u0434\u0430\u043d\u0438\u044f' in payload
+                                or '\u0411\u0430\u043b\u043b\u044b \u0437\u0430' in payload):
+            return True                              # таблица баллов = chrome
+        return False
+
     def is_chrome(self, text, pno, page, lb=None):
         if Profile.is_chrome(self, text, pno, page, lb):
             return True
@@ -388,7 +394,8 @@ equiv cup cap subset subseteq supset supseteq forall exists neg wedge vee perp p
 nabla text operatorname left right begin end cases alpha beta gamma delta epsilon varepsilon zeta
 eta theta vartheta iota kappa lambda mu nu xi pi varpi rho sigma tau upsilon phi varphi chi psi
 omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega sin cos tan cot log ln lg min max
-gcd lim exp deg arcsin arccos""".split())
+gcd lim exp deg arcsin arccos aligned bmod pmod mid notin iff binom lvert rvert lfloor rfloor
+lceil rceil vec overrightarrow overline underline div quad qquad neq langle rangle""".split())
 
 
 def _math_ok(frag):
@@ -417,6 +424,8 @@ def _math_ok(frag):
         return 'left/right mismatch'
     if frag.count(r'\begin{cases}') != frag.count(r'\end{cases}'):
         return 'cases mismatch'
+    if frag.count(r'\begin{aligned}') != frag.count(r'\end{aligned}'):
+        return 'aligned mismatch'
     if re.search(r'\^\s*\^|_\s*_', frag):
         return 'double script'
     return None
@@ -490,20 +499,27 @@ def validate_md(md, warnings):
 def page_geometry(page):
     h_bars, curves, draw_rects = [], [], []
     for d in page.get_drawings():
-        draw_rects.append(fitz.Rect(d['rect']))
+        fill_only = d.get('type') == 'f'
+        keep_rect = False
         for it in d['items']:
             if it[0] == 'l':
                 (x0, y0), (x1, y1) = it[1], it[2]
                 if abs(y0 - y1) < 0.6 and abs(x1 - x0) > 2:
                     h_bars.append((min(x0, x1), max(x0, x1), (y0 + y1) / 2))
+                keep_rect = True
             elif it[0] == 're':
                 rr = it[1]
-                if rr.width > 2 and rr.height < 1.4:          # тонкий прямоуг. = дробная черта (Word)
+                thin = min(rr.width, rr.height) < 1.4
+                if fill_only and not thin:
+                    continue                        # заливка-подсветка/фон: не геометрия
+                if rr.width > 2 and rr.height < 1.4:
                     h_bars.append((rr.x0, rr.x1, (rr.y0 + rr.y1) / 2))
-                else:
-                    h_bars += [(rr.x0, rr.x1, rr.y0), (rr.x0, rr.x1, rr.y1)]
+                keep_rect = True
             elif it[0] == 'c':
                 curves.append(fitz.Rect(d['rect']))
+                keep_rect = True
+        if keep_rect:
+            draw_rects.append(fitz.Rect(d['rect']))
     img_rects = [fitz.Rect(im['bbox']) for im in page.get_image_info()]
     return h_bars, curves, draw_rects, img_rects
 
@@ -528,15 +544,22 @@ def cluster_rects(rects, gap=20):
 
 
 def detect_graphics(page, curves, draw_rects, img_rects, prof=None):
+    def _seg(a, b):
+        if abs(a[0] - b[0]) + abs(a[1] - b[1]) >= 2.5:      # торцы тонких прямоугольников — мусор
+            segs.append((a, b))
+
     segs = []
     for d in page.get_drawings():
+        fill_only = d.get('type') == 'f'
         for it in d['items']:
             if it[0] == 'l':
-                segs.append((it[1], it[2]))
+                _seg(it[1], it[2])
             elif it[0] == 're':
                 rr = it[1]
-                segs += [((rr.x0, rr.y0), (rr.x1, rr.y0)), ((rr.x0, rr.y1), (rr.x1, rr.y1)),
-                         ((rr.x0, rr.y0), (rr.x0, rr.y1)), ((rr.x1, rr.y0), (rr.x1, rr.y1))]
+                if fill_only and min(rr.width, rr.height) >= 1.4:
+                    continue                        # подсветка/фон
+                _seg((rr.x0, rr.y0), (rr.x1, rr.y0)); _seg((rr.x0, rr.y1), (rr.x1, rr.y1))
+                _seg((rr.x0, rr.y0), (rr.x0, rr.y1)); _seg((rr.x1, rr.y0), (rr.x1, rr.y1))
     clusters = cluster_rects(draw_rects + img_rects, gap=20)
     figures, tables = [], []
     for c in clusters:
@@ -616,17 +639,26 @@ def units_to_tex(units, base_size, prof):
     return tex
 
 
-def rows_to_tex(units, base_size, prof):
+def rows_to_tex(units, base_size, prof, inline=False):
     if not units:
         return ''
     rows = rows_split(units, base_size)
     parts = [units_to_tex(sorted(r, key=lambda u: u['x0']), base_size, prof) for r in rows]
-    tex = ' '.join(p for p in parts if p)
+    parts = [p for p in parts if p]
+    if len(parts) >= 2 and not inline:
+        anchored = []
+        for p_ in parts:
+            if '=' in p_ and '&' not in p_:
+                p_ = p_.replace('=', '&=', 1)
+            anchored.append(p_)
+        tex = r'\begin{aligned} ' + r' \\ '.join(anchored) + r' \end{aligned}'
+    else:
+        tex = ' '.join(parts)
     tex = re.sub(r'([=<>+\-]|\\[lg]e(?:qslant)?|\\Leftrightarrow)\s+\1(?![\w])', r'\1', tex)
     return re.sub(r'\s{2,}', ' ', tex).strip()
 
 
-def render_region(spans, bars, base_size, prof):
+def render_region(spans, bars, base_size, prof, inline=False):
     bars = sorted([b for b in bars if (b[1] - b[0]) > 3], key=lambda b: (b[1] - b[0]))
     units = [{'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
               'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': s['bbox'][3] - s['bbox'][1]} for s in spans]
@@ -663,10 +695,10 @@ def render_region(spans, bars, base_size, prof):
         units = rest
     if cases:
         rows = rows_split(units, base_size)
-        body = r' \\ '.join(units_to_tex(sorted(r, key=lambda u: u['x0']), base_size, prof)
-                              for r in rows if r)
-        return r'\begin{cases} %s \end{cases}' % body
-    return rows_to_tex(units, base_size, prof)
+        rparts = [units_to_tex(sorted(r, key=lambda u: u['x0']), base_size, prof) for r in rows]
+        rparts = [p for p in rparts if p.strip()]
+        return r'\begin{cases} %s \end{cases}' % r' \\ '.join(rparts)
+    return rows_to_tex(units, base_size, prof, inline=inline)
 
 
 def rows_split(units, base_size):
@@ -689,7 +721,7 @@ def inline_line_tex(spans, base_size, prof, bars=()):
     def flush():
         if not buf:
             return
-        tex = render_region(list(buf), list(bars), base_size, prof)
+        tex = render_region(list(buf), list(bars), base_size, prof, inline=True)
         if tex:
             out.append('$' + tex + '$')
         buf.clear()
@@ -795,6 +827,42 @@ def parse(pdf_path, outdir):
                               'centered': (lb.x0 - page.rect.x0 > 110) and (page.rect.x1 - lb.x1 > 110),
                               'bold': bool(spans[0]['flags'] & 16),
                               'italic': bool(spans[0]['flags'] & 2) and not prof.is_math_span(spans[0])})
+        for L in lines:
+            L['bars'] = [hb for hb in h_bars
+                         if L['y0'] - 2 <= hb[2] <= L['y1'] + 2
+                         and hb[0] >= L['x0'] - 6 and hb[1] <= L['x1'] + 6]
+        # инлайн-дроби Word: числитель/знаменатель приходят отдельными math-строками,
+        # вертикально пересекающими текстовую строку -> вливаем их в неё
+        if not prof.math_as_image:
+            absorbed = [False] * len(lines)
+            for li, L in enumerate(lines):
+                if not L['math'] or absorbed[li]:
+                    continue
+                if any(s['size'] >= base_size * 0.9 for s in L['spans'] if s['text'].strip()):
+                    continue                     # крупное — блочному пути (cases/display)
+                cand = []
+                for tj, T in enumerate(lines):
+                    if T['math'] or absorbed[tj] or tj == li:
+                        continue
+                    if L['y0'] < T['y1'] + 2 and T['y0'] < L['y1'] + 2 \
+                            and L['x0'] < T['x1'] + 15 and T['x0'] < L['x1'] + 15:
+                        ov = min(L['y1'], T['y1']) - max(L['y0'], T['y0'])
+                        has_bar = any(hb[0] - 3 <= L['x1'] and L['x0'] <= hb[1] + 3
+                                      and min(L['y0'], T['y0']) - 3 <= hb[2] <= max(L['y1'], T['y1']) + 3
+                                      for hb in h_bars)
+                        cand.append((has_bar, ov, tj))
+                if cand:
+                    cand.sort(reverse=True)
+                    T = lines[cand[0][2]]
+                    T['spans'] = sorted(T['spans'] + L['spans'],
+                                        key=lambda s: (s['bbox'][0], s['bbox'][1]))
+                    T['x0'] = min(T['x0'], L['x0']); T['x1'] = max(T['x1'], L['x1'])
+                    T['y0'] = min(T['y0'], L['y0']); T['y1'] = max(T['y1'], L['y1'])
+                    T['bars'] = [hb for hb in h_bars
+                                 if T['y0'] - 2 <= hb[2] <= T['y1'] + 2
+                                 and hb[0] >= T['x0'] - 6 and hb[1] <= T['x1'] + 6]
+                    absorbed[li] = True
+            lines = [L for k, L in enumerate(lines) if not absorbed[k]]
         lines.sort(key=lambda L: (round(L['y']), L['x0']))
 
         if prof.math_as_image:
@@ -1033,7 +1101,8 @@ def parse(pdf_path, outdir):
 
         # kind == 'line'
         text = payload.get('pre_md') if payload.get('pre_md') is not None \
-            else inline_line_tex(payload['spans'], base_size, prof, bars=[])
+            else inline_line_tex(payload['spans'], base_size, prof,
+                                 bars=payload.get('bars') or [])
         if not text:
             continue
         plain = re.sub(r'\*\*', '', text)
