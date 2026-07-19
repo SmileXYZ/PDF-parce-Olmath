@@ -226,13 +226,27 @@ class WordVG(WordOMML):
 
     def handle_stream(self, ctx, kind, payload, plain=None):
         if kind == 'table':
-            m = self.RUB_RE.search(payload)
-            if m:
-                ctx.ensure_task(int(m.group(1)))
+            if not self.RUB_RE.search(payload):
+                return False
+            rows = payload.split('\n')
+            cur_n = getattr(ctx, 'vg_rub_task', None)
+            chunks = {}
+            for row in rows:
+                m = self.RUB_RE.search(row)
+                if m:
+                    cur_n = int(m.group(1))
+                    ctx.vg_rub_task = cur_n
+                if cur_n is not None:
+                    chunks.setdefault(cur_n, []).append(row)
+            for n, rws in chunks.items():
+                ctx.ensure_task(n)
                 ctx.new_section('rubric', '\u041a\u0440\u0438\u0442\u0435\u0440\u0438\u0438')
-                ctx.add_part(('text', '\n' + payload + '\n', None))
-                return True
-            return False
+                body = [r for r in rws if r.strip()]
+                if body and not body[0].startswith('|---'):
+                    hdr = '|' + '---|' * max(1, body[0].count('|') - 1)
+                    body = [body[0], hdr] + [r for r in body[1:] if not r.startswith('|---')]
+                ctx.add_part(('text', '\n' + '\n'.join(body) + '\n', None))
+            return True
         if kind != 'line':
             return False
         v = self.VAR_RE.match(plain)
@@ -662,8 +676,24 @@ def rows_to_tex(units, base_size, prof, inline=False):
 
 def render_region(spans, bars, base_size, prof, inline=False):
     bars = sorted([b for b in bars if (b[1] - b[0]) > 3], key=lambda b: (b[1] - b[0]))
-    units = [{'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
-              'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': s['bbox'][3] - s['bbox'][1]} for s in spans]
+    units = []
+    for s in spans:
+        h = s['bbox'][3] - s['bbox'][1]
+        chars = s.get('chars')
+        if chars and h > s['size'] * 1.35 and len(chars) > 1:
+            for ch in chars:                     # спан слепил символы с разных этажей
+                if not ch['c'].strip():
+                    continue
+                cs = dict(s)
+                cs['text'] = ch['c']
+                cs['bbox'] = ch['bbox']
+                cs.pop('chars', None)
+                units.append({'span': cs, 'x0': ch['bbox'][0], 'x1': ch['bbox'][2],
+                              'cy': (ch['bbox'][1] + ch['bbox'][3]) / 2,
+                              'h': ch['bbox'][3] - ch['bbox'][1]})
+        else:
+            units.append({'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
+                          'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': h})
     # система уравнений: '{' слева от вертикального стека (>=2 строк) -> \begin{cases}
     has_brace = any(u.get('span') and u['span']['text'].strip() == '{' for u in units)
     tall = any(u.get('span') and u['span']['text'].strip() == '{' and u['h'] > base_size * 1.6
@@ -809,10 +839,13 @@ def parse(pdf_path, outdir):
             stream.append((pno, (t[0].y0 + t[0].y1) / 2, 'table', t))
 
         lines = []
-        for b in page.get_text('dict')['blocks']:
+        for b in page.get_text('rawdict')['blocks']:
             if b['type'] != 0:
                 continue
             for l in b['lines']:
+                for s in l['spans']:
+                    if 'chars' in s:
+                        s['text'] = ''.join(ch['c'] for ch in s['chars'])
                 lb = fitz.Rect(l['bbox'])
                 if lb.width < 250 and any(z.intersects(lb) and (z & lb).get_area() > lb.get_area() * .5
                                           for z in fig_zones):
