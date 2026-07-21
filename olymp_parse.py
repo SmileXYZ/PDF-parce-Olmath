@@ -73,7 +73,9 @@ class Profile:
     TASK_RE = re.compile(r'^\u0417\u0430\u0434\u0430\u0447\u0430\s+(\d+)\s*\.')
     task_needs_bold = True
     SECTION_RE = re.compile(
-        r'^(\u041e\u0442\u0432\u0435\u0442|\u0420\u0435\u0448\u0435\u043d\u0438\u0435(?:\s+\d+)?|'
+        r'^(\u041e\u0442\u0432\u0435\u0442|'
+        r'(?:\u041f\u0435\u0440\u0432\u043e\u0435|\u0412\u0442\u043e\u0440\u043e\u0435|\u0422\u0440\u0435\u0442\u044c\u0435)\s+\u0440\u0435\u0448\u0435\u043d\u0438\u0435|'
+        r'\u0420\u0435\u0448\u0435\u043d\u0438\u0435(?:\s+\d+)?|'
         r'\u0421\u043f\u043e\u0441\u043e\u0431(?:\s+\d+)?|\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0439(?:\s+\d+)?|'
         r'\u041e\u0446\u0435\u043d\u043a\u0430|\u041f\u0440\u0438\u043c\u0435\u0440|'
         r'\u0417\u0430\u043c\u0435\u0447\u0430\u043d\u0438\u0435[^.:]*|'
@@ -108,11 +110,61 @@ class Profile:
     def handle_stream(self, ctx, kind, payload, plain=None):
         return False
 
+    # хук: структурная строка, которую нельзя выбрасывать при пересечении с фигурой
+    def force_keep(self, text):
+        return False
+
 
 class LatexNative(Profile):     # pdfTeX ММО (9-sol) — эталон
     name = "latex-native"
     GLYPH = {'\x12': r'\left(', '\x13': r'\right)', '\x0e': r'\left(', '\x0f': r'\right)',
              '\x10': r'\left[', '\x11': r'\right]'}
+    # листки ММО двух видов: «Задача N.» (9-sol) и просто «N.» жирным (8-sol)
+    TASK_RE = re.compile(r'^(?:\u0417\u0430\u0434\u0430\u0447\u0430\s+)?(\d+)\s*\.(?!\d)')
+    # строка вида («Название задачи», Автор) или («Название», (Автор)) — не курсив
+    TITLE_AUTHOR_RE = re.compile(r'^\(\u00ab([^\u00bb]{1,60})\u00bb,\s*(.{2,80}?)\)$')
+    # автор «(М. Фамилия[, И. Фамилия...])» в конце строки условия (без курсива)
+    TRAIL_AUTHOR_RE = re.compile(
+        r'\(((?:[\u0410-\u042f\u0401]\.\s?)+[\u0410-\u042f\u0401][\u0430-\u044f\u0451-]+'
+        r'(?:\s*,\s*(?:[\u0410-\u042f\u0401]\.\s?)+[\u0410-\u042f\u0401][\u0430-\u044f\u0451-]+)*)\)\s*$')
+    # «Версия – 1 Ответ: ... Решение: ...» — вариантные решения листка
+    VERSION_RE = re.compile(r'^\u0412\u0435\u0440\u0441\u0438\u044f\s*[\u2013\u2014-]?\s*(\d+)\s*')
+    VER_ANS_RE = re.compile(r'^\u041e\u0442\u0432\u0435\u0442:\s*(.*?)\s*\u0420\u0435\u0448\u0435\u043d\u0438\u0435:\s*')
+
+    def handle_stream(self, ctx, kind, payload, plain=None):
+        if kind != 'line' or ctx.cur is None or plain is None:
+            return False
+        t = plain.strip()
+        m = self.TITLE_AUTHOR_RE.match(t)
+        if m:
+            ctx.cur['meta_extra']['title'] = m.group(1).strip()
+            a = m.group(2).strip()
+            if a.startswith('(') and a.endswith(')'):
+                a = a[1:-1].strip()
+            ctx.cur['author'] = a
+            return True
+        v = self.VERSION_RE.match(t)
+        if v and payload['italic']:
+            rest = t[v.end():].strip()
+            am = self.VER_ANS_RE.match(rest)
+            if am:
+                if not ctx.cur.get('answer_md'):
+                    ctx.cur['answer_md'] = am.group(1).strip()
+                rest = rest[am.end():].strip()
+            ctx.new_section('solution', '\u0412\u0435\u0440\u0441\u0438\u044f ' + v.group(1))
+            if rest:
+                ctx.add_part(('text', rest, None))
+            return True
+        if ctx.section is not None and ctx.section['kind'] == 'statement' \
+                and not payload['bold']:
+            m2 = self.TRAIL_AUTHOR_RE.search(t)
+            if m2 and ctx.cur.get('author') is None:
+                ctx.cur['author'] = m2.group(1).strip()
+                before = t[:m2.start()].strip()
+                if before:
+                    ctx.add_part(('text', before, None))
+                return True
+        return False
 
 
 class LatexQuartz(Profile):     # macOS Quartz LaTeX (Ломоносов testPDF) + варианты
@@ -351,6 +403,237 @@ class MathTypeImage(Profile):
                 return True
         return False
 
+
+
+class MccmeBook(Profile):
+    """Книги ММО от МЦНМО (83mmo и вся серия): SchoolBookC + битый ToUnicode.
+
+    Издательский баг: к SchoolBookC-MathItalic прикручен CMap TeX-MI-H
+    (карта для кодировки CMMI), а шрифт перекодирован в ASCII через
+    /Encoding /Differences. ToUnicode при этом врёт: ( -> U+21BC и т.д.
+    Ремап строится динамически из /Differences (истина) против ToUnicode.
+    Структура: УСЛОВИЯ ЗАДАЧ -> «N класс (M-й день)» -> «N.» жирным;
+    РЕШЕНИЯ ЗАДАЧ -> те же номера с ран-ином «Ответ.»; капс-заголовок
+    после решений (СТАТИСТИКА...) закрывает книгу."""
+    name = "mccme-book"
+    task_needs_bold = True
+    TASK_RE = re.compile(r'$^')          # generic-задачи глушим, всё в handle_stream
+    GRADE_RE = re.compile(
+        r'^(\d+)\s+\u043a\u043b\u0430\u0441\u0441'
+        r'(?:\s*(?:\((\d)-\u0439\s+\u0434\u0435\u043d\u044c\)'
+        r'|,\s*(\u043f\u0435\u0440\u0432\u044b\u0439|\u0432\u0442\u043e\u0440\u043e\u0439)\s+\u0434\u0435\u043d\u044c))?\s*$')
+    BTASK_RE = re.compile(r'^(?:\u0417\u0430\u0434\u0430\u0447\u0430\s+)?(\d+)\.\s*')
+    CAPS_RE = re.compile(r'^[\u0410-\u042f\u0401][\u0410-\u042f\u0401\s\u00ab\u00bb,.\u2014-]{7,}$')
+    RUNIN_RE = re.compile(
+        r'^(\u041e\u0442\u0432\u0435\u0442|'
+        r'\u0420\u0435\u0448\u0435\u043d\u0438\u0435(?:\s+\d+)?|'
+        r'\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438[\u0439\u0438](?:\s+\d+)?)\s*[.:]\s*')
+    SOLSPLIT_RE = re.compile(
+        r'\s((?:\u041f\u0435\u0440\u0432\u043e\u0435|\u0412\u0442\u043e\u0440\u043e\u0435|\u0422\u0440\u0435\u0442\u044c\u0435)\s+\u0440\u0435\u0448\u0435\u043d\u0438\u0435|\u0420\u0435\u0448\u0435\u043d\u0438\u0435)\s*[.:]\s*')
+    # SECTION_RE базовый + «Комментарии» во множественном числе
+    SECTION_RE = re.compile(
+        r'^(\u041e\u0442\u0432\u0435\u0442|'
+        r'(?:\u041f\u0435\u0440\u0432\u043e\u0435|\u0412\u0442\u043e\u0440\u043e\u0435|\u0422\u0440\u0435\u0442\u044c\u0435)\s+\u0440\u0435\u0448\u0435\u043d\u0438\u0435|'
+        r'\u0420\u0435\u0448\u0435\u043d\u0438\u0435(?:\s+\d+)?|'
+        r'\u0421\u043f\u043e\u0441\u043e\u0431(?:\s+\d+)?|\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438[\u0439\u0438](?:\s+\d+)?|'
+        r'\u041e\u0446\u0435\u043d\u043a\u0430|\u041f\u0440\u0438\u043c\u0435\u0440|'
+        r'\u0417\u0430\u043c\u0435\u0447\u0430\u043d\u0438\u0435[^.:]*|'
+        r'\u0414\u043e\u043a\u0430\u0437\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u043e(?:\s+\d+)?|'
+        r'\u041a\u0440\u0438\u0442\u0435\u0440\u0438\u0438[^\n]{0,90}?)\s*[.:)]')
+
+    # статический фолбэк, если динамический ремап не построился
+    FALLBACK_REMAP = {'\u21bc': '(', '\u21bd': ')', '\u21c0': '*', '\u25b7': '/',
+                      '\U0001d6ff': '\u00b7', '\u266d': '[', '\u266f': ']',
+                      '\U0001d6a4': '{', '\u2118': '}'}
+    _AGL_PUNCT = {'parenleft': '(', 'parenright': ')', 'slash': '/', 'asterisk': '*',
+                  'periodcentered': '\u00b7', 'bracketleft': '[', 'bracketright': ']',
+                  'braceleft': '{', 'braceright': '}', 'less': '<', 'greater': '>',
+                  'lessequal': '\u2a7d', 'greaterequal': '\u2a7e',
+                  'comma': ',', 'period': '.', 'plus': '+', 'equal': '='}
+
+    def __init__(self, doc=None):
+        self.remap = dict(self.FALLBACK_REMAP)
+        if doc is not None:
+            try:
+                self.remap.update(self._dynamic_remap(doc))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _dynamic_remap(doc):
+        """wrong_char -> right_char: сверка /Differences (глифы) с ToUnicode."""
+        diff_re = re.compile(r'/Differences\s*\[(.*?)\]', re.S)
+        tok_re = re.compile(r'(\d+)|/([A-Za-z0-9.]+)')
+        bfr_re = re.compile(r'<([0-9A-Fa-f]{2})>\s*<([0-9A-Fa-f]{2})>\s*<([0-9A-Fa-f]{4,8})>')
+        bfc_re = re.compile(r'<([0-9A-Fa-f]{2})>\s*<([0-9A-Fa-f]{4,8})>')
+
+        def blocks(s, kind):
+            return '\n'.join(re.findall(r'beginbf%s(.*?)endbf%s' % (kind, kind), s, re.S))
+
+        remap = {}
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref, compressed=True)
+            except Exception:
+                continue
+            if '/BaseFont' not in obj or 'MathItalic' not in obj:
+                continue
+            me = re.search(r'/Encoding\s+(\d+)\s+0\s+R', obj)
+            mt = re.search(r'/ToUnicode\s+(\d+)\s+0\s+R', obj)
+            if not (me and mt):
+                continue
+            md = diff_re.search(doc.xref_object(int(me.group(1)), compressed=False))
+            if not md:
+                continue
+            diffs, code = {}, 0
+            for num, gname in tok_re.findall(md.group(1)):
+                if num:
+                    code = int(num)
+                else:
+                    diffs[code] = gname
+                    code += 1
+            try:
+                cmap = doc.xref_stream(int(mt.group(1))).decode('latin-1', 'replace')
+            except Exception:
+                continue
+            tou = {}
+            for lo, hi, start in bfr_re.findall(blocks(cmap, 'range')):
+                base = bytes.fromhex(start).decode('utf-16-be', 'replace')
+                if len(base) == 1:
+                    for i in range(int(hi, 16) - int(lo, 16) + 1):
+                        tou[int(lo, 16) + i] = chr(ord(base) + i)
+            for c2, uni in bfc_re.findall(blocks(cmap, 'char')):
+                tou[int(c2, 16)] = bytes.fromhex(uni).decode('utf-16-be', 'replace')
+            for code, gname in diffs.items():
+                right = MccmeBook._AGL_PUNCT.get(gname)
+                wrong = tou.get(code)
+                if right and wrong and wrong != right and \
+                        unicodedata.normalize('NFKC', wrong) != right:
+                    remap[wrong] = right
+        return remap
+
+    def _fix(self, text):
+        rm = self.remap
+        return ''.join(rm.get(c, c) for c in text)
+
+    def to_tex(self, text):
+        return Profile.to_tex(self, self._fix(text))
+
+    def clean_text(self, text):
+        return Profile.clean_text(self, self._fix(text))
+
+    def is_math_font(self, font):
+        return font.endswith('MathItalic') or Profile.is_math_font(self, font)
+
+    def force_keep(self, text):
+        t = text.strip()
+        return bool(self.GRADE_RE.match(t) or self.CAPS_RE.fullmatch(t)
+                    or self.BTASK_RE.match(t))
+
+    # цифры и знаки набраны текстовым SchoolBookC даже внутри формул;
+    # мелкий кегль = верхний/нижний индекс -> в math-буфер, там геометрия соберёт ^{}
+    _SCRIPTISH = re.compile(r'[0-9.,()+\-=*/]{1,8}$')
+
+    def is_math_span(self, s):
+        if self.is_math_font(s['font']):
+            return True
+        t = s['text'].strip()
+        if t and self._SCRIPTISH.fullmatch(t) \
+                and s['size'] < getattr(self, 'base_size', 10) * 0.85:
+            return True
+        return False
+
+    # автор «(М. А. Фамилия[, что угодно])» в конце строки условия
+    TRAIL_AUTHOR_RE = re.compile(
+        r'\(((?:[\u0410-\u042f\u0401]\.\s?){1,2}[\u0410-\u042f\u0401][\u0430-\u044f\u0451-]+'
+        r'(?:,[^()]{0,40})?)\)\s*$')
+
+    _ORD_SOL = ('\u041f\u0435\u0440\u0432\u043e\u0435', '\u0412\u0442\u043e\u0440\u043e\u0435',
+                '\u0422\u0440\u0435\u0442\u044c\u0435')  # Первое/Второе/Третье
+
+    def classify_section(self, base):
+        if base.startswith('\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438'):
+            return 'comment'
+        if base in self._ORD_SOL:
+            return 'solution'
+        return Profile.classify_section(self, base)
+
+    def is_chrome(self, text, pno, page, lb=None):
+        if Profile.is_chrome(self, text, pno, page, lb):
+            return True
+        # глифы Type3-шрифтов картинок (F85/F90) текстом не являются
+        return False
+
+    def handle_stream(self, ctx, kind, payload, plain=None):
+        if kind != 'line':
+            return False
+        if getattr(ctx, 'book_done', False):
+            return True
+        t = plain.strip()
+        if self.CAPS_RE.fullmatch(t):
+            U = '\u0423\u0421\u041b\u041e\u0412\u0418\u042f \u0417\u0410\u0414\u0410\u0427'  # УСЛОВИЯ ЗАДАЧ
+            R = '\u0420\u0415\u0428\u0415\u041d\u0418\u042f \u0417\u0410\u0414\u0410\u0427'  # РЕШЕНИЯ ЗАДАЧ
+            if t == U:
+                ctx.book_part = 'cond'
+            elif t == R and getattr(ctx, 'book_part', None):
+                ctx.book_part = 'sol'
+            elif getattr(ctx, 'book_part', None) == 'sol':
+                ctx.book_done = True  # СТАТИСТИКА... = конец решений
+            return True
+        g = self.GRADE_RE.match(t)
+        if g:
+            ctx.book_grade = int(g.group(1))
+            if g.group(2):
+                ctx.book_day = int(g.group(2))
+            elif g.group(3):
+                ctx.book_day = 1 if g.group(3).startswith('\u043f\u0435\u0440\u0432') else 2
+            else:
+                ctx.book_day = 0
+            return True
+        m = self.BTASK_RE.match(t)
+        if m and payload['bold'] and getattr(ctx, 'book_grade', 0):
+            n0 = int(m.group(1))
+            n = (ctx.book_grade * 10 + getattr(ctx, 'book_day', 0)) * 100 + n0
+            exists = any(tk['number'] == n for tk in ctx.tasks)
+            if exists:
+                ctx.ensure_task(n)
+            else:
+                meta = {'grade': ctx.book_grade, 'orig_number': n0}
+                if getattr(ctx, 'book_day', 0):
+                    meta['day'] = ctx.book_day
+                ctx.start_task(n, meta=meta)
+            rest = t[m.end():].strip()
+            r = self.RUNIN_RE.match(rest)
+            if r:
+                title = r.group(1)
+                kind0 = self.classify_section(title.split()[0])
+                ctx.new_section(kind0, title)
+                rest = rest[r.end():].strip()
+                if kind0 == 'answer':
+                    sm = self.SOLSPLIT_RE.search(rest)
+                    if sm:
+                        ans = rest[:sm.start()].strip()
+                        if ans:
+                            ctx.add_part(('text', ans, None))
+                        ctx.new_section('solution', sm.group(1))
+                        rest = rest[sm.end():].strip()
+            elif exists:
+                ctx.new_section('solution', '\u0420\u0435\u0448\u0435\u043d\u0438\u0435')
+            if rest:
+                ctx.add_part(('text', rest, None))
+            return True
+        if ctx.cur is not None and ctx.section is not None \
+                and ctx.section['kind'] == 'statement' and not payload['bold']:
+            m2 = self.TRAIL_AUTHOR_RE.search(t)
+            if m2 and ctx.cur.get('author') is None:
+                ctx.cur['author'] = m2.group(1).strip()
+                before = t[:m2.start()].strip()
+                if before:
+                    ctx.add_part(('text', before, None))
+                return True
+        return False
+
+
 def detect(doc):
     prod = (doc.metadata.get('producer') or '').lower()
     fonts = set()
@@ -383,6 +666,8 @@ def detect(doc):
                             pua += 1
     if '\u041a\u0435\u043d\u0433\u0443\u0440\u0443' in text0:
         return Kenguru()
+    if any('SchoolBookC' in f for f in fonts):
+        return MccmeBook(doc)
     latex = any(f[:2] in ('CM', 'MS') for f in fonts if f not in ('MT Extra',)) and \
             any(f.startswith('CM') for f in fonts)
     if latex:
@@ -817,6 +1102,7 @@ def parse(pdf_path, outdir):
              if b['type'] == 0 for l in b['lines'] for s in l['spans']
              if not prof.is_math_span(s) and s['text'].strip()]
     base_size = statistics.mode([round(s) for s in sizes]) if sizes else 10
+    prof.base_size = base_size
 
     stream, fig_no_holder = [], [0]
     for pno, page in enumerate(doc):
@@ -849,7 +1135,9 @@ def parse(pdf_path, outdir):
                 lb = fitz.Rect(l['bbox'])
                 if lb.width < 250 and any(z.intersects(lb) and (z & lb).get_area() > lb.get_area() * .5
                                           for z in fig_zones):
-                    continue
+                    raw0 = ''.join(s['text'] for s in l['spans']).strip()
+                    if not prof.force_keep(raw0):
+                        continue
                 spans = l['spans']
                 if not spans:
                     continue
