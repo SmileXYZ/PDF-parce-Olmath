@@ -26,6 +26,8 @@ SYM = {
     '\u2225': r'\parallel ', '\u2205': r'\varnothing ', '\u2213': r'\mp ', '\u2207': r'\nabla ',
     '\u2260': r'\ne ', '\u2013': '-', '\u2014': '\u2014',
     '{': r'\{', '}': r'\}',
+    '\u23a7': '', '\u23a8': '', '\u23a9': '', '\u23aa': '',
+    '\u23ab': '', '\u23ac': '', '\u23ad': '',
 }
 NAMED = {'sin', 'cos', 'tg', 'ctg', 'cot', 'arctg', 'arcctg', 'arcsin', 'arccos',
          'tan', 'log', 'ln', 'lg', 'min', 'max', 'gcd', 'lcm', 'lim', 'exp', 'deg'}
@@ -38,6 +40,25 @@ def apply_named(tex):
         repl = ('\\' + f) if f in BUILTIN else ('\\operatorname{%s}' % f)
         tex = re.sub(r'(?<![A-Za-z\\])' + f + r'(?![A-Za-z])', lambda _m, r=repl: r, tex)
     return tex
+
+
+def _cm_radical_kind(s):
+    """CMEX 0x70-0x76: p/q/r/s — цельные радикалы разных размеров,
+    v/u/t — верх/удлинитель/низ составной лесенки. ToUnicode обычно
+    отдаёт их как ASCII-буквы; иногда как U+221A. Плюс √ из CMSY."""
+    t = s['text'].strip()
+    if not t:
+        return None
+    font = s.get('font', '')
+    if font.startswith('CMEX'):
+        if all(c in 'pqrs\u221a' for c in t):
+            return 'single'
+        if all(c in 'vut' for c in t):
+            return 'piece'
+        return None
+    if t == '\u221a':
+        return 'single'
+    return None
 
 
 # ===================================================================== PROFILES
@@ -114,9 +135,23 @@ class Profile:
     def force_keep(self, text):
         return False
 
+    # хук: пометки math по спанам строки с учётом контекста соседей;
+    # по умолчанию — просто is_math_span для каждого
+    def math_span_flags(self, spans):
+        return [self.is_math_span(s) for s in spans]
+
+    # хук: классификация знаков радикалов для геометрической сборки \sqrt.
+    # 'single' — цельный знак (CMEX p/q/r/s, √), 'piece' — кусок лесенки
+    # (CMEX v/u/t: верх/удлинитель/низ), None — не радикал (сборка выключена).
+    def radical_kind(self, s):
+        return None
+
 
 class LatexNative(Profile):     # pdfTeX ММО (9-sol) — эталон
     name = "latex-native"
+
+    def radical_kind(self, s):
+        return _cm_radical_kind(s)
     GLYPH = {'\x12': r'\left(', '\x13': r'\right)', '\x0e': r'\left(', '\x0f': r'\right)',
              '\x10': r'\left[', '\x11': r'\right]'}
     # листки ММО двух видов: «Задача N.» (9-sol) и просто «N.» жирным (8-sol)
@@ -417,6 +452,7 @@ class MccmeBook(Profile):
     после решений (СТАТИСТИКА...) закрывает книгу."""
     name = "mccme-book"
     task_needs_bold = True
+    absorb_fullsize_math = True     # инлайн-дроби книги набраны полным кеглем
     TASK_RE = re.compile(r'$^')          # generic-задачи глушим, всё в handle_stream
     GRADE_RE = re.compile(
         r'^(\d+)\s+\u043a\u043b\u0430\u0441\u0441'
@@ -525,23 +561,55 @@ class MccmeBook(Profile):
     def is_math_font(self, font):
         return font.endswith('MathItalic') or Profile.is_math_font(self, font)
 
+    def radical_kind(self, s):
+        return _cm_radical_kind(s)
+
     def force_keep(self, text):
         t = text.strip()
         return bool(self.GRADE_RE.match(t) or self.CAPS_RE.fullmatch(t)
                     or self.BTASK_RE.match(t))
 
-    # цифры и знаки набраны текстовым SchoolBookC даже внутри формул;
-    # мелкий кегль = верхний/нижний индекс -> в math-буфер, там геометрия соберёт ^{}
-    _SCRIPTISH = re.compile(r'[0-9.,()+\-=*/]{1,8}$')
+    # цифры и знаки набраны текстовым SchoolBookC даже внутри формул.
+    # Спаны рвутся по смене шрифта, поэтому чисто цифро-знаковый спан прямого
+    # SchoolBookC существует только внутри формулы (сосед — math-шрифт):
+    # полный кегль — часть формулы, мелкий — верхний/нижний индекс.
+    _SCRIPTISH = re.compile(r'[0-9.,()+\-=*/]{1,12}$')
+    _PUNCTISH = re.compile(r'[.,()+\-=*/:\s]{1,12}$')
 
     def is_math_span(self, s):
         if self.is_math_font(s['font']):
             return True
         t = s['text'].strip()
-        if t and self._SCRIPTISH.fullmatch(t) \
-                and s['size'] < getattr(self, 'base_size', 10) * 0.85:
-            return True
+        if t and self._SCRIPTISH.fullmatch(t):
+            if s['font'] == 'SchoolBookC' and any(c.isdigit() for c in t):
+                return True                      # полный кегль — только с цифрой
+            if s['size'] < getattr(self, 'base_size', 10) * 0.85:
+                return True
         return False
+
+    def math_span_flags(self, spans):
+        # чисто-пунктуационный спан прямого SchoolBookC («. . .», «+», «(»)
+        # математичен, только если с ОБЕИХ сторон math; край строки считается
+        # «за math». Точка после жирного «Ответ» так остаётся текстом, а
+        # многоточия и знаки внутри формульных строк уходят в math.
+        flags = [self.is_math_span(s) for s in spans]
+        nz = [k for k, s in enumerate(spans) if s['text'].strip()]
+        cand = [k for k in nz
+                if not flags[k] and spans[k]['font'] == 'SchoolBookC'
+                and self._PUNCTISH.fullmatch(spans[k]['text'].strip())]
+        for _ in range(4):
+            changed = False
+            for k in cand:
+                if flags[k]:
+                    continue
+                i = nz.index(k)
+                lf = flags[nz[i - 1]] if i > 0 else True
+                rf = flags[nz[i + 1]] if i + 1 < len(nz) else True
+                if lf and rf:
+                    flags[k] = changed = True
+            if not changed:
+                break
+        return flags
 
     # автор «(М. А. Фамилия[, что угодно])» в конце строки условия
     TRAIL_AUTHOR_RE = re.compile(
@@ -790,7 +858,7 @@ def validate_md(md, warnings):
     md = re.sub(r'\$\$\s*([\s\S]*?)\s*\$\$', lambda m: handle(m, True), md)
     md = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)\$(?!\$)', lambda m: handle(m, False), md)
     md = re.sub(r'\n?\$\$\s*\$\$\n?', '\n', md)
-    md = re.sub(r'\$(\s*)\$', ' ', md)
+    md = re.sub(r'(?<!\$)\$\s+\$(?!\$)', ' ', md)   # пустые/смежные инлайн-пары, но не $$
     return md
 
 
@@ -959,37 +1027,8 @@ def rows_to_tex(units, base_size, prof, inline=False):
     return re.sub(r'\s{2,}', ' ', tex).strip()
 
 
-def render_region(spans, bars, base_size, prof, inline=False):
-    bars = sorted([b for b in bars if (b[1] - b[0]) > 3], key=lambda b: (b[1] - b[0]))
-    units = []
-    for s in spans:
-        h = s['bbox'][3] - s['bbox'][1]
-        chars = s.get('chars')
-        if chars and h > s['size'] * 1.35 and len(chars) > 1:
-            for ch in chars:                     # спан слепил символы с разных этажей
-                if not ch['c'].strip():
-                    continue
-                cs = dict(s)
-                cs['text'] = ch['c']
-                cs['bbox'] = ch['bbox']
-                cs.pop('chars', None)
-                units.append({'span': cs, 'x0': ch['bbox'][0], 'x1': ch['bbox'][2],
-                              'cy': (ch['bbox'][1] + ch['bbox'][3]) / 2,
-                              'h': ch['bbox'][3] - ch['bbox'][1]})
-        else:
-            units.append({'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
-                          'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': h})
-    # система уравнений: '{' слева от вертикального стека (>=2 строк) -> \begin{cases}
-    has_brace = any(u.get('span') and u['span']['text'].strip() == '{' for u in units)
-    tall = any(u.get('span') and u['span']['text'].strip() == '{' and u['h'] > base_size * 1.6
-               for u in units)
-    nrows0 = len(rows_split([u for u in units
-                             if not (u.get('span') and u['span']['text'].strip() in '{}')],
-                            base_size))
-    cases = has_brace and (tall or nrows0 >= 2)
-    if cases:
-        units = [u for u in units
-                 if not (u.get('span') and u['span']['text'].strip() in ('{', '}'))]
+def apply_fraction_bars(units, bars, base_size, prof):
+    """Горизонтальные черты -> \\dfrac{num}{den} (вынесено из render_region)."""
     band = base_size * 0.95
     for x0, x1, y in bars:
         num, den, rest = [], [], []
@@ -1010,6 +1049,157 @@ def render_region(spans, bars, base_size, prof, inline=False):
             continue
         rest.append({'tex': r'\dfrac{%s}{%s}' % (numT, denT), 'x0': x0, 'x1': x1, 'cy': y})
         units = rest
+    return units
+
+
+def assemble_radicals(units, bars, base_size, prof):
+    """Геометрическая сборка \\sqrt. Якорь винкулюм-черты — ORIGIN глифа
+    (bbox спана метрический и врёт): у CMEX p/q/r/s и CMSY \u221a черта лежит
+    на origin ±2pt, у лесенки v/u+/t — на origin верхнего куска. Подкоренное —
+    юниты под чертой в её x-диапазоне, глубина ограничена TeX-глубиной глифа.
+    Сборка изнутри наружу (правее знак = глубже вложен); дроби внутри
+    подкоренного сворачиваются тем же apply_fraction_bars."""
+
+    def _oy(u):
+        sp = u['span']
+        ch = sp.get('chars')
+        if ch:
+            og = ch[0].get('origin')
+            if og:
+                return og[1]
+        og = sp.get('origin')
+        if og:
+            return og[1]
+        return u['cy'] + u['h'] * 0.3                  # фолбэк: чуть выше низа
+
+    DEPTH = {'\u221a': 1.05, 'p': 1.3, 'q': 1.8, 'r': 2.3, 's': 2.8}
+
+    singles, pieces, rest = [], [], []
+    for u in units:
+        s = u.get('span')
+        k = prof.radical_kind(s) if s is not None else None
+        if k == 'single':
+            singles.append(u)
+        elif k == 'piece':
+            pieces.append(u)
+        else:
+            rest.append(u)
+    if not singles and not pieces:
+        return units, bars
+
+    rads = []
+    # лесенки: куски одной x-колонки при вертикальной смежности origin-ов
+    for u in sorted(pieces, key=lambda u: (u['x0'], _oy(u))):
+        oy, sz = _oy(u), u['span']['size']
+        home = None
+        for L in rads:
+            if L['kind'] == 'ladder' and abs(L['x0'] - u['x0']) < 3.5 \
+                    and oy < L['oy_max'] + sz * 1.4:
+                home = L
+                break
+        if home is None:
+            rads.append({'kind': 'ladder', 'x0': u['x0'], 'x1': u['x1'],
+                         'oy': oy, 'oy_max': oy, 'size': sz})
+        else:
+            home['x0'] = min(home['x0'], u['x0']); home['x1'] = max(home['x1'], u['x1'])
+            home['oy'] = min(home['oy'], oy); home['oy_max'] = max(home['oy_max'], oy)
+    for u in singles:
+        ch = u['span']['text'].strip()[:1]
+        rads.append({'kind': 'single', 'x0': u['x0'], 'x1': u['x1'],
+                     'oy': _oy(u), 'oy_max': _oy(u), 'size': u['span']['size'],
+                     'depth': DEPTH.get(ch, 1.3)})
+
+    units = rest
+    for R in sorted(rads, key=lambda r: -r['x0']):     # изнутри наружу
+        if R['kind'] == 'ladder':
+            ry1 = R['oy_max'] + R['size'] * 1.1 + 2
+        else:
+            ry1 = R['oy'] + R['size'] * R['depth'] + 2
+        vinc = None
+        for b in bars:
+            if (R['x1'] - 3.5 <= b[0] <= R['x1'] + 6) and \
+               (R['oy'] - 2.2 <= b[2] <= R['oy'] + 2.2):
+                if vinc is None or b[1] > vinc[1]:
+                    vinc = b                             # самая длинная подходящая
+        if vinc is not None:
+            rx0, rx1, ry0 = R['x1'] - 2, vinc[1] + 2, vinc[2]
+            bars = [b for b in bars if b is not vinc]
+        else:
+            rx0, rx1, ry0 = R['x1'] - 2, None, R['oy'] - 1
+        inside, outside = [], []
+        for u in units:
+            ucx = (u['x0'] + u['x1']) / 2
+            if u['cy'] < ry0 + 0.5 or u['cy'] > ry1 or ucx < rx0:
+                outside.append(u)
+            elif rx1 is not None and ucx > rx1:
+                outside.append(u)
+            else:
+                inside.append(u)
+        if rx1 is None:
+            # без черты: только непрерывный ран, примыкающий к знаку справа
+            inside.sort(key=lambda u: u['x0'])
+            run, edge = [], R['x1'] + base_size * 0.9
+            for u in inside:
+                if u['x0'] <= edge:
+                    run.append(u); edge = max(edge, u['x1'] + base_size * 0.6)
+                else:
+                    outside.append(u)
+            inside = run
+        if not inside:
+            units = outside                              # знак без подкоренного: съесть
+            continue
+        if rx1 is not None:
+            def _inbar(b):
+                return rx0 - 2 <= b[0] and b[1] <= rx1 + 2 and ry0 + 0.5 <= b[2] <= ry1
+            inbars = [b for b in bars if _inbar(b)]
+            bars = [b for b in bars if not _inbar(b)]
+            if inbars:
+                inside = apply_fraction_bars(inside, inbars, base_size, prof)
+        tex = units_to_tex(sorted(inside, key=lambda u: u['x0']), base_size, prof)
+        cys = [u['cy'] for u in inside]
+        units = outside + [{'tex': r'\sqrt{%s}' % tex, 'x0': R['x0'],
+                            'x1': rx1 if rx1 is not None else max(u['x1'] for u in inside),
+                            'cy': sum(cys) / len(cys)}]
+    return units, bars
+
+
+def render_region(spans, bars, base_size, prof, inline=False):
+    bars = sorted([b for b in bars if (b[1] - b[0]) > 3], key=lambda b: (b[1] - b[0]))
+    units = []
+    for s in spans:
+        h = s['bbox'][3] - s['bbox'][1]
+        chars = s.get('chars')
+        if chars and h > s['size'] * 1.35 and len(chars) > 1:
+            for ch in chars:                     # спан слепил символы с разных этажей
+                if not ch['c'].strip():
+                    continue
+                cs = dict(s)
+                cs['text'] = ch['c']
+                cs['bbox'] = ch['bbox']
+                cs['origin'] = ch.get('origin')
+                cs.pop('chars', None)
+                units.append({'span': cs, 'x0': ch['bbox'][0], 'x1': ch['bbox'][2],
+                              'cy': (ch['bbox'][1] + ch['bbox'][3]) / 2,
+                              'h': ch['bbox'][3] - ch['bbox'][1]})
+        else:
+            units.append({'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
+                          'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': h})
+    # система уравнений: '{' (или куски CMEX-скобки \u23a7\u23a8\u23a9\u23aa)
+    # слева от вертикального стека (>=2 строк) -> \begin{cases}
+    _LB = ('{', '\u23a7', '\u23a8', '\u23a9', '\u23aa')
+    _RB = ('}', '\u23ab', '\u23ac', '\u23ad')
+    has_brace = any(u.get('span') and u['span']['text'].strip() in _LB for u in units)
+    tall = any(u.get('span') and u['span']['text'].strip() in _LB and u['h'] > base_size * 1.6
+               for u in units)
+    nrows0 = len(rows_split([u for u in units
+                             if not (u.get('span') and u['span']['text'].strip() in _LB + _RB)],
+                            base_size))
+    cases = has_brace and (tall or nrows0 >= 2)
+    if cases:
+        units = [u for u in units
+                 if not (u.get('span') and u['span']['text'].strip() in _LB + _RB)]
+    units, bars = assemble_radicals(units, bars, base_size, prof)
+    units = apply_fraction_bars(units, bars, base_size, prof)
     if cases:
         rows = rows_split(units, base_size)
         rparts = [units_to_tex(sorted(r, key=lambda u: u['x0']), base_size, prof) for r in rows]
@@ -1144,7 +1334,8 @@ def parse(pdf_path, outdir):
                 raw = ''.join(s['text'] for s in spans).strip()
                 if prof.is_chrome(raw, pno, page, lb):
                     continue
-                only_math = all(prof.is_math_span(s) or not s['text'].strip() for s in spans)
+                _mf = prof.math_span_flags(spans)
+                only_math = all(f or not s['text'].strip() for f, s in zip(_mf, spans))
                 lines.append({'y': lb.y0, 'x0': lb.x0, 'x1': lb.x1, 'y0': lb.y0, 'y1': lb.y1,
                               'spans': spans, 'math': only_math,
                               'centered': (lb.x0 - page.rect.x0 > 110) and (page.rect.x1 - lb.x1 > 110),
@@ -1161,7 +1352,9 @@ def parse(pdf_path, outdir):
             for li, L in enumerate(lines):
                 if not L['math'] or absorbed[li]:
                     continue
-                if any(s['size'] >= base_size * 0.9 for s in L['spans'] if s['text'].strip()):
+                fullsize = any(s['size'] >= base_size * 0.9
+                               for s in L['spans'] if s['text'].strip())
+                if fullsize and not getattr(prof, 'absorb_fullsize_math', False):
                     continue                     # крупное — блочному пути (cases/display)
                 cand = []
                 for tj, T in enumerate(lines):
@@ -1176,6 +1369,10 @@ def parse(pdf_path, outdir):
                         cand.append((has_bar, ov, tj))
                 if cand:
                     cand.sort(reverse=True)
+                    # полнокегельная math-строка вливается только при реальном
+                    # перекрытии (>=2pt) или общей дробной черте, иначе — display
+                    if fullsize and not cand[0][0] and cand[0][1] < 2:
+                        continue
                     T = lines[cand[0][2]]
                     T['spans'] = sorted(T['spans'] + L['spans'],
                                         key=lambda s: (s['bbox'][0], s['bbox'][1]))
@@ -1186,7 +1383,20 @@ def parse(pdf_path, outdir):
                                  and hb[0] >= T['x0'] - 6 and hb[1] <= T['x1'] + 6]
                     absorbed[li] = True
             lines = [L for k, L in enumerate(lines) if not absorbed[k]]
-        lines.sort(key=lambda L: (round(L['y']), L['x0']))
+        # бандинг визуальных рядов: строки одного ряда (перекрытие по вертикали)
+        # получают общий якорный y, чтобы порядок по x0 пережил и lines.sort,
+        # и стабильный stream.sort (жирный «2.» и первая строка условия могут
+        # отличаться по y0 на доли пункта в любую сторону)
+        lines.sort(key=lambda L: (L['y0'], L['x0']))
+        row_y, row_y1 = None, None
+        for L in lines:
+            hh = max(L['y1'] - L['y0'], 1.0)
+            if row_y1 is None or L['y0'] > row_y1 - 0.45 * hh:
+                row_y, row_y1 = L['y0'], L['y1']
+            else:
+                row_y1 = max(row_y1, L['y1'])
+            L['y'] = row_y
+        lines.sort(key=lambda L: (L['y'], L['x0']))
 
         if prof.math_as_image:
             mi = 0
@@ -1234,7 +1444,7 @@ def parse(pdf_path, outdir):
                     continue
                 if any(prof.is_math_span(s) for s in L['spans']):
                     sp = L['spans']
-                    marks = [prof.is_math_span(s) for s in sp]
+                    marks = prof.math_span_flags(sp)
                     glue = getattr(prof, 'glue_span', None)
                     if glue:
                         for _ in range(2):
