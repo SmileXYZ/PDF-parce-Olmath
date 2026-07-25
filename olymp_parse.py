@@ -26,6 +26,7 @@ SYM = {
     '\u2225': r'\parallel ', '\u2205': r'\varnothing ', '\u2213': r'\mp ', '\u2207': r'\nabla ',
     '\u2260': r'\ne ', '\u2013': '-', '\u2014': '\u2014',
     '{': r'\{', '}': r'\}',
+    '\u22c5': r'\cdot ', '\u2218': r'\circ ', '\u2236': ':', '\u27fa': r'\iff ',
     '\u23a7': '', '\u23a8': '', '\u23a9': '', '\u23aa': '',
     '\u23ab': '', '\u23ac': '', '\u23ad': '',
 }
@@ -200,6 +201,20 @@ class LatexNative(Profile):     # pdfTeX ММО (9-sol) — эталон
                     ctx.add_part(('text', before, None))
                 return True
         return False
+
+
+class XetexStix(LatexNative):
+    """ММО-2026+: XeTeX + STIX Two. Текст STIXTwoText-*, вся математика в
+    STIXTwoMath-Regular юникодом (math-alnum снимается NFKC в to_tex, символы
+    через SYM). PyMuPDF рвёт line-объекты по колонкам дробей, поэтому строки
+    одного визуального ряда склеиваются (merge_row_lines) — тогда числитель,
+    знаменатель и черта попадают в один render_region и дроби собираются
+    штатной геометрией."""
+    name = "xetex-stix"
+    merge_row_lines = True
+
+    def is_math_font(self, font):
+        return 'STIXTwoMath' in font
 
 
 class LatexQuartz(Profile):     # macOS Quartz LaTeX (Ломоносов testPDF) + варианты
@@ -736,6 +751,8 @@ def detect(doc):
         return Kenguru()
     if any('SchoolBookC' in f for f in fonts):
         return MccmeBook(doc)
+    if any('STIXTwoMath' in f for f in fonts):
+        return XetexStix()
     latex = any(f[:2] in ('CM', 'MS') for f in fonts if f not in ('MT Extra',)) and \
             any(f.startswith('CM') for f in fonts)
     if latex:
@@ -762,7 +779,8 @@ nabla text operatorname left right begin end cases alpha beta gamma delta epsilo
 eta theta vartheta iota kappa lambda mu nu xi pi varpi rho sigma tau upsilon phi varphi chi psi
 omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega sin cos tan cot log ln lg min max
 gcd lim exp deg arcsin arccos aligned bmod pmod mid notin iff binom lvert rvert lfloor rfloor
-lceil rceil vec overrightarrow overline underline div quad qquad neq langle rangle""".split())
+lceil rceil vec overrightarrow overline underline div quad qquad neq langle rangle
+overgroup undergroup smallsmile smallfrown""".split())
 
 
 def _math_ok(frag):
@@ -1003,6 +1021,13 @@ def units_to_tex(units, base_size, prof):
     tex = re.sub(r'\^\{([^{}]*)\}\s*\^\{([^{}]*)\}', r'^{\1\2}', tex)  # соседние ^
     tex = re.sub(r'_\{([^{}]*)\}\s*_\{([^{}]*)\}', r'_{\1\2}', tex)      # соседние _
     tex = apply_named(tex)
+    # дуга ⏜/⏝ (XeTeX/STIX): в x-порядке знак дуги идёт СРАЗУ ПОСЛЕ своих
+    # букв (x0 дуги на ~1pt правее x0 букв) — привязываем назад, знак
+    # =/+/- между буквами и дугой переносим за скобку
+    tex = re.sub(r'([A-Z]{1,4})\s*([=+\-.,]?)\s*\u23dc', r'\\overgroup{\1}\2', tex)
+    tex = re.sub(r'([A-Z]{1,4})\s*([=+\-.,]?)\s*\u23dd', r'\\undergroup{\1}\2', tex)
+    tex = re.sub(r'\u23dc\s*([A-Z]{1,4})', r'\\overgroup{\1}', tex)   # добивка: дуга перед буквами
+    tex = re.sub(r'\u23dd\s*([A-Z]{1,4})', r'\\undergroup{\1}', tex)
     tex = re.sub(r'[\u0410-\u044f\u0401\u0451][\u0410-\u044f\u0401\u0451 ]*',
                  lambda m: r'\text{' + m.group(0).rstrip() + '}', tex)   # кириллица -> \text{}
     return tex
@@ -1191,13 +1216,16 @@ def render_region(spans, bars, base_size, prof, inline=False):
     has_brace = any(u.get('span') and u['span']['text'].strip() in _LB for u in units)
     tall = any(u.get('span') and u['span']['text'].strip() in _LB and u['h'] > base_size * 1.6
                for u in units)
+    # '' в наборе: пустые/пробельные спаны не должны мостить ряды в rows_split
+    # (в оригинале это давал побочный эффект строкового in: '' in '{}' == True)
+    _STRIP = _LB + _RB + ('',)
     nrows0 = len(rows_split([u for u in units
-                             if not (u.get('span') and u['span']['text'].strip() in _LB + _RB)],
+                             if not (u.get('span') and u['span']['text'].strip() in _STRIP)],
                             base_size))
     cases = has_brace and (tall or nrows0 >= 2)
     if cases:
         units = [u for u in units
-                 if not (u.get('span') and u['span']['text'].strip() in _LB + _RB)]
+                 if not (u.get('span') and u['span']['text'].strip() in _STRIP)]
     units, bars = assemble_radicals(units, bars, base_size, prof)
     units = apply_fraction_bars(units, bars, base_size, prof)
     if cases:
@@ -1345,10 +1373,45 @@ def parse(pdf_path, outdir):
             L['bars'] = [hb for hb in h_bars
                          if L['y0'] - 2 <= hb[2] <= L['y1'] + 2
                          and hb[0] >= L['x0'] - 6 and hb[1] <= L['x1'] + 6]
+        # бандинг визуальных рядов: строки одного ряда (перекрытие по вертикали)
+        # получают общий якорный y, чтобы порядок по x0 пережил и lines.sort,
+        # и стабильный stream.sort (жирный «2.» и первая строка условия могут
+        # отличаться по y0 на доли пункта в любую сторону)
+        lines.sort(key=lambda L: (L['y0'], L['x0']))
+        row_y = None
+        for L in lines:
+            hh = max(L['y1'] - L['y0'], 1.0)
+            # ряд = строки с почти одинаковым y0 (микроразброс, индексные и
+            # дробные сдвиги); перекрытие боксов не годится — аномально высокие
+            # склеенные строки (Quartz) мостили бы соседние ряды
+            if row_y is None or L['y0'] > row_y + 0.5 * min(hh, base_size * 1.2):
+                row_y = L['y0']
+            L['y'] = row_y
+        lines.sort(key=lambda L: (L['y'], L['x0']))
+        if getattr(prof, 'merge_row_lines', False):
+            # XeTeX/STIX: PyMuPDF рвёт строки по колонкам дробей — склеиваем
+            # line-объекты одного визуального ряда, чтобы числитель, знаменатель
+            # и черта оказались в одном render_region
+            merged, cur = [], None
+            for L in lines:
+                if cur is not None and L['y'] == cur['y']:
+                    cur['spans'] = sorted(cur['spans'] + L['spans'],
+                                          key=lambda s: (s['bbox'][0], s['bbox'][1]))
+                    cur['x0'] = min(cur['x0'], L['x0']); cur['x1'] = max(cur['x1'], L['x1'])
+                    cur['y0'] = min(cur['y0'], L['y0']); cur['y1'] = max(cur['y1'], L['y1'])
+                    cur['math'] = cur['math'] and L['math']
+                    cur['bars'] += [b for b in L['bars'] if b not in cur['bars']]
+                else:
+                    cur = L
+                    merged.append(cur)
+            lines = merged
+            for L in lines:
+                L['centered'] = (L['x0'] - page.rect.x0 > 110) and (page.rect.x1 - L['x1'] > 110)
         # инлайн-дроби Word: числитель/знаменатель приходят отдельными math-строками,
         # вертикально пересекающими текстовую строку -> вливаем их в неё
         if not prof.math_as_image:
             absorbed = [False] * len(lines)
+            bar_home = {}                        # черта -> индекс строки-цели
             for li, L in enumerate(lines):
                 if not L['math'] or absorbed[li]:
                     continue
@@ -1373,7 +1436,18 @@ def parse(pdf_path, outdir):
                     # перекрытии (>=2pt) или общей дробной черте, иначе — display
                     if fullsize and not cand[0][0] and cand[0][1] < 2:
                         continue
-                    T = lines[cand[0][2]]
+                    # числитель и знаменатель одной черты обязаны уйти в одну
+                    # цель: первая всосавшаяся строка регистрирует свою черту
+                    near = L['bars']
+                    forced = None
+                    for hb in near:
+                        if hb in bar_home and not lines[bar_home[hb]]['math'] \
+                                and not absorbed[bar_home[hb]]:
+                            forced = bar_home[hb]
+                            break
+                    T = lines[forced if forced is not None else cand[0][2]]
+                    for hb in near:
+                        bar_home.setdefault(hb, forced if forced is not None else cand[0][2])
                     T['spans'] = sorted(T['spans'] + L['spans'],
                                         key=lambda s: (s['bbox'][0], s['bbox'][1]))
                     T['x0'] = min(T['x0'], L['x0']); T['x1'] = max(T['x1'], L['x1'])
@@ -1383,20 +1457,6 @@ def parse(pdf_path, outdir):
                                  and hb[0] >= T['x0'] - 6 and hb[1] <= T['x1'] + 6]
                     absorbed[li] = True
             lines = [L for k, L in enumerate(lines) if not absorbed[k]]
-        # бандинг визуальных рядов: строки одного ряда (перекрытие по вертикали)
-        # получают общий якорный y, чтобы порядок по x0 пережил и lines.sort,
-        # и стабильный stream.sort (жирный «2.» и первая строка условия могут
-        # отличаться по y0 на доли пункта в любую сторону)
-        lines.sort(key=lambda L: (L['y0'], L['x0']))
-        row_y, row_y1 = None, None
-        for L in lines:
-            hh = max(L['y1'] - L['y0'], 1.0)
-            if row_y1 is None or L['y0'] > row_y1 - 0.45 * hh:
-                row_y, row_y1 = L['y0'], L['y1']
-            else:
-                row_y1 = max(row_y1, L['y1'])
-            L['y'] = row_y
-        lines.sort(key=lambda L: (L['y'], L['x0']))
 
         if prof.math_as_image:
             mi = 0
