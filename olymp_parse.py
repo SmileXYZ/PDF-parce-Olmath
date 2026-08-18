@@ -5,6 +5,8 @@
 import os, re, json, statistics, unicodedata
 import fitz
 
+PARSER_VERSION = 'v3.16'
+
 DPI = 200
 
 # ---- shared symbol table (Unicode glyph -> TeX), used after NFKC normalize ----
@@ -19,7 +21,7 @@ SYM = {
     '\u03bb': r'\lambda ', '\u03bc': r'\mu ', '\u03c1': r'\rho ', '\u03c3': r'\sigma ',
     '\u03c4': r'\tau ', '\u03b8': r'\theta ', '\u03be': r'\xi ', '\u0394': r'\Delta ',
     '\u2211': r'\sum ', '\u220f': r'\prod ', '\u222b': r'\int ', '\u2202': r'\partial ',
-    '\u2032': "'", '\u2033': "''", '\u2026': r'\ldots ', '\u25a1': '', '\u223c': r'\sim ',
+    '\u2032': "'", '\u2033': "''", '\u0338': '\u0002', '\u2026': r'\ldots ', '\u25a1': '', '\u223c': r'\sim ',
     '\u2248': r'\approx ', '\u2261': r'\equiv ', '\u222a': r'\cup ', '\u2229': r'\cap ',
     '\u2282': r'\subset ', '\u2286': r'\subseteq ', '\u2200': r'\forall ', '\u2203': r'\exists ',
     '\u00ac': r'\neg ', '\u2227': r'\wedge ', '\u2228': r'\vee ', '\u22a5': r'\perp ',
@@ -657,6 +659,10 @@ def units_to_tex(units, base_size, prof):
     tex = apply_named(tex)
     tex = re.sub(r'[\u0410-\u044f\u0401\u0451][\u0410-\u044f\u0401\u0451 ]*',
                  lambda m: r'\text{' + m.group(0).rstrip() + '}', tex)   # кириллица -> \text{}
+    # комбинирующая негация: X\u0338 = -> X \\ne
+    tex = re.sub('\u0002\\s*=', r' \\ne ', tex)
+    tex = re.sub('\u0002\\s*\\\\in\\b', r' \\notin ', tex)
+    tex = tex.replace('\u0002', '')
     # маркеры радикалов: куски одного корня (отдельные спаны) -> один маркер
     tex = re.sub('(?:\u0001\\s*)+', '\u0001', tex)
     # вложение вправо до конца региона (цепочки вложенных корней)
@@ -1286,6 +1292,7 @@ def parse(pdf_path, outdir):
                 target_obj.setdefault('comments', []).append({'title': sec['title'], 'body_md': body})
 
     result = {'source': os.path.basename(pdf_path), 'profile': prof.name,
+              'parser_version': PARSER_VERSION,
               'base_size': base_size, 'tasks': []}
     for t in ctx.tasks:
         obj = {'number': t['number'], 'author': t['author'], 'statement_md': '',
