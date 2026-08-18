@@ -657,7 +657,9 @@ def units_to_tex(units, base_size, prof):
     tex = apply_named(tex)
     tex = re.sub(r'[\u0410-\u044f\u0401\u0451][\u0410-\u044f\u0401\u0451 ]*',
                  lambda m: r'\text{' + m.group(0).rstrip() + '}', tex)   # кириллица -> \text{}
-    # маркеры радикалов: вложение вправо до конца региона (цепочки вложенных корней)
+    # маркеры радикалов: куски одного корня (отдельные спаны) -> один маркер
+    tex = re.sub('(?:\u0001\\s*)+', '\u0001', tex)
+    # вложение вправо до конца региона (цепочки вложенных корней)
     while '\u0001' in tex:
         i = tex.rfind('\u0001')
         inner = tex[i + 1:].strip()
@@ -707,6 +709,21 @@ def render_region(spans, bars, base_size, prof, inline=False):
         else:
             units.append({'span': s, 'x0': s['bbox'][0], 'x1': s['bbox'][2],
                           'cy': (s['bbox'][1] + s['bbox'][3]) / 2, 'h': h})
+    # CM-негация: prime-глиф CMSY, наложенный по x на '=' -> \ne
+    for u in list(units):
+        s = u.get('span')
+        if not s or s['text'].strip() != '\u2032' or not s['font'].startswith('CMSY'):
+            continue
+        for v in units:
+            sv = v.get('span')
+            if not sv or '=' not in sv['text']:
+                continue
+            ov = min(u['x1'], v['x1']) - max(u['x0'], v['x0'])
+            if ov > (u['x1'] - u['x0']) * 0.4 and abs(u['cy'] - v['cy']) < s['size'] * 1.2:
+                sv = dict(sv); sv['text'] = sv['text'].replace('=', ' \\ne ', 1)
+                v['span'] = sv
+                units.remove(u)
+                break
     # система уравнений: '{' слева от вертикального стека (>=2 строк) -> \begin{cases}
     has_brace = any(u.get('span') and u['span']['text'].strip() == '{' for u in units)
     tall = any(u.get('span') and u['span']['text'].strip() == '{' and u['h'] > base_size * 1.6
