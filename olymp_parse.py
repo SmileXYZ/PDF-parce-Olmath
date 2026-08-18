@@ -58,7 +58,10 @@ class Profile:
 
     GLYPH = {}                      # profile-specific glyph overrides (raw char -> TeX)
 
-    def to_tex(self, text):         # math text -> TeX fragment (no sup/sub, that's geometry)
+    def to_tex(self, text, font=None):   # math text -> TeX fragment (no sup/sub, that's geometry)
+        if font and font.startswith('CMEX'):
+            # куски составного радикала CM (v=низ, u=удлинитель, t=верх; p..s=корни) -> маркер
+            text = re.sub(r'[pqrstuv]+', '\u0001', text)
         text = unicodedata.normalize('NFKC', text)
         out = []
         for c in text:
@@ -621,7 +624,7 @@ def units_to_tex(units, base_size, prof):
             out.append(u['tex']); base_y = u.get('cy', base_y)
             continue
         s = u['span']
-        txt = prof.to_tex(s['text'])
+        txt = prof.to_tex(s['text'], s.get('font'))
         size = s['size']
         cy = (s['bbox'][1] + s['bbox'][3]) / 2
         if size < local * 0.82 and base_y is not None and abs(cy - base_y) > local * 0.22:
@@ -654,6 +657,12 @@ def units_to_tex(units, base_size, prof):
     tex = apply_named(tex)
     tex = re.sub(r'[\u0410-\u044f\u0401\u0451][\u0410-\u044f\u0401\u0451 ]*',
                  lambda m: r'\text{' + m.group(0).rstrip() + '}', tex)   # кириллица -> \text{}
+    # маркеры радикалов: вложение вправо до конца региона (цепочки вложенных корней)
+    while '\u0001' in tex:
+        i = tex.rfind('\u0001')
+        inner = tex[i + 1:].strip()
+        tex = tex[:i] + (r'\sqrt{%s}' % inner if inner else '')
+    tex = re.sub(r'\\sqrt\{\s*\}', '', tex)
     return tex
 
 
