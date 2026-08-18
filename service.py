@@ -36,7 +36,7 @@ MAX_BYTES = int(os.environ.get("MAX_PDF_BYTES", 40 * 1024 * 1024))  # 40 MB
 
 @app.get("/health")
 def health():
-    return {"ok": True, "pymupdf": olymp_parse.fitz.__doc__.splitlines()[0]}
+    return {"ok": True, "version": olymp_parse.PARSER_VERSION, "pymupdf": olymp_parse.fitz.__doc__.splitlines()[0]}
 
 
 async def _read_pdf_bytes(request: Request, file: UploadFile | None) -> bytes:
