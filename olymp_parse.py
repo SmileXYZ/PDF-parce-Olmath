@@ -5,7 +5,7 @@
 import os, re, json, statistics, unicodedata
 import fitz
 
-PARSER_VERSION = 'v3.16'
+PARSER_VERSION = 'v3.18'
 
 DPI = 200
 
@@ -491,6 +491,63 @@ def _demote(frag):
     return re.sub(r'\s+', ' ', t).strip()
 
 
+def _normalize_tex(frag):
+    """Санитайзер math-фрагмента: чинит то, что ломает рендер на фронте.
+
+    Ловит весь класс escape-багов до того, как они уедут во фронт:
+    сиротские переносы KaTeX, реальные \n/\t внутри формулы,
+    команды, слипшиеся с кириллицей, кириллица без \text{}.
+    """
+    CYR = '\u0410-\u044f\u0401\u0451'
+    # 1) двойной бэкслеш = перенос строки KaTeX. Вне cases/aligned он ломает $-границы.
+    if '\\begin' not in frag:
+        frag = re.sub(r'\\\\(?![a-zA-Z])', ' ', frag)
+    # 2) реальные переносы/табы внутри формулы
+    for ch in ('\n', '\r', '\t'):
+        frag = frag.replace(ch, ' ')
+    # 3) команда, слипшаяся с кириллицей: \angleполучаем -> \angle получаем
+    frag = re.sub(r'(\\[a-zA-Z]+)([' + CYR + r'])', r'\1 \2', frag)
+    # 4) кириллица внутри math-режима без \text{}
+    def _wrap(m):
+        s = m.group(0).strip()
+        return ('\\text{' + s + '}') if s else ''
+    frag = re.sub(r'(?<!\\text\{)[' + CYR + r'][' + CYR + r' ]*', _wrap, frag)
+    frag = re.sub(r'\\text\{\s*\}', '', frag)
+    return re.sub(r'\s{2,}', ' ', frag).strip()
+
+
+def selftest():
+    """Инварианты вывода. Непустой список = релиз ломает фронт.
+
+    Запуск:  python3 olymp_parse.py --selftest
+    """
+    fails = []
+    BS = chr(92)
+
+    out = _normalize_tex('AM ' + BS + 'ne CK')
+    if BS + 'ne' not in out or '\n' in out or BS + BS in out:
+        fails.append('negation: ' + repr(out))
+
+    out = _normalize_tex('a ' + BS + BS + ' b')
+    if BS + BS in out:
+        fails.append('orphan-linebreak: ' + repr(out))
+
+    out = _normalize_tex(BS + 'begin{cases} a ' + BS + BS + ' b ' + BS + 'end{cases}')
+    if BS + BS not in out:
+        fails.append('cases-linebreak-lost: ' + repr(out))
+
+    out = _normalize_tex(BS + 'angle' + '\u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c')
+    if BS + 'angle ' not in out:
+        fails.append('cmd-glued-cyrillic: ' + repr(out))
+
+    w = []
+    v = validate_md('$AM ' + BS + 'ne CK$', w)
+    if BS + 'ne' not in v or '\n' in v:
+        fails.append('validate_md: ' + repr(v))
+
+    return fails
+
+
 def validate_md(md, warnings):
     if not md:
         return md
@@ -499,9 +556,12 @@ def validate_md(md, warnings):
         frag = m.group(1).strip()
         if not frag:
             return ' '
+        if '\\begin' not in frag:
+            frag = frag.replace('\\\\', ' ')                 # сиротский перенос строки -> пробел
+        frag = _normalize_tex(frag)
         err = _math_ok(frag)
         if err is None:
-            return m.group(0)
+            return ('\n$$\n%s\n$$\n' % frag) if display else ('$%s$' % frag)
         fixed = _math_fix(frag)
         if _math_ok(fixed) is None:
             warnings.append({'was': frag[:80], 'fix': 'auto', 'err': err})
@@ -660,8 +720,8 @@ def units_to_tex(units, base_size, prof):
     tex = re.sub(r'[\u0410-\u044f\u0401\u0451][\u0410-\u044f\u0401\u0451 ]*',
                  lambda m: r'\text{' + m.group(0).rstrip() + '}', tex)   # кириллица -> \text{}
     # комбинирующая негация: X\u0338 = -> X \\ne
-    tex = re.sub('\u0002\\s*=', r' \\ne ', tex)
-    tex = re.sub('\u0002\\s*\\\\in\\b', r' \\notin ', tex)
+    tex = re.sub('\u0002\\s*=', lambda m: ' \\ne ', tex)
+    tex = re.sub('\u0002\\s*\\\\in\\b', lambda m: ' \\notin ', tex)
     tex = tex.replace('\u0002', '')
     # маркеры радикалов: куски одного корня (отдельные спаны) -> один маркер
     tex = re.sub('(?:\u0001\\s*)+', '\u0001', tex)
@@ -1331,6 +1391,12 @@ def parse(pdf_path, outdir):
 
 if __name__ == '__main__':
     import sys
+    if '--selftest' in sys.argv:
+        _f = selftest()
+        print('SELFTEST:', 'PASS' if not _f else 'FAIL')
+        for _x in _f:
+            print('   ', _x)
+        sys.exit(1 if _f else 0)
     r = parse(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'out')
     nv = sum(len(t.get('variants', [])) for t in r['tasks'])
     print('profile:', r['profile'], '| tasks:', len(r['tasks']), '| variants:', nv,
